@@ -39,7 +39,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=1e-5)
 
     # data / model
-    parser.add_argument("--dataset", type=str, default="lorenz", choices=["lorenz", "burgers", "dr", "swe"])
+    parser.add_argument("--dataset", type=str, default="lorenz", choices=["lorenz",
+        "burgers",
+        "dr",
+        "swe",
+        "swe_full_small",
+    ],
+)
     parser.add_argument("--dataset-path", type=str, default=None)
     parser.add_argument("--model", type=str, default="SimpleMLP", choices=["UNet1D", "UNet2D", "FNO1d", "FNO2d", "DiT", "SimpleMLP"])
     parser.add_argument("--spline-type", type=str, default="quintic", choices=["linear", "quintic"])
