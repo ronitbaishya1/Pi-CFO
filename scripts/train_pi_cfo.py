@@ -1,4 +1,4 @@
-"""CLI entrypoint for CFO training experiments."""
+"""CLI entrypoint for Physics-Informed CFO training experiments."""
 
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from utils.readers import load_dataset_splits
 
-from cfo import ContinuousFlowOperator
+from pi_cfo import PhysicsInformedCFO
 
 from models.factory import build_model
 
@@ -80,7 +80,10 @@ from utils.seed import set_global_seed
 def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
-        description="Train CFO model"
+        description=(
+            "Train Physics-Informed "
+            "Continuous Flow Operator"
+        )
     )
 
     # ------------------------------------------------------------
@@ -110,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ------------------------------------------------------------
-    # OPTIMIZATION / CFO DYNAMICS
+    # OPTIMIZATION
     # ------------------------------------------------------------
 
     parser.add_argument(
@@ -130,6 +133,10 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.99,
     )
+
+    # ------------------------------------------------------------
+    # CFO STOCHASTIC PATH
+    # ------------------------------------------------------------
 
     parser.add_argument(
         "--gamma",
@@ -227,9 +234,52 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Seed used ONLY to select temporal snapshots when "
             "--partial-train-ratio < 1. "
-            "Keep this fixed across model seeds during multi-seed "
+            "Keep fixed across model seeds during multi-seed "
             "experiments."
         ),
+    )
+
+    # ============================================================
+    # PHYSICS-INFORMED PARAMETERS
+    # ============================================================
+
+    parser.add_argument(
+        "--lambda-pde",
+        type=float,
+        default=1e-3,
+        help=(
+            "Weight multiplying the "
+            "shallow-water PDE residual loss."
+        ),
+    )
+
+    # ------------------------------------------------------------
+    # Grid spacing for current 32 x 32 domain.
+    #
+    # Domain:
+    #
+    # [-2.5, 2.5]^2
+    #
+    # dx = dy = 5 / 32
+    #          = 0.15625
+    # ------------------------------------------------------------
+
+    parser.add_argument(
+        "--dx",
+        type=float,
+        default=0.15625,
+    )
+
+    parser.add_argument(
+        "--dy",
+        type=float,
+        default=0.15625,
+    )
+
+    parser.add_argument(
+        "--gravity",
+        type=float,
+        default=1.0,
     )
 
     # ------------------------------------------------------------
@@ -251,7 +301,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ckpt-prefix",
         type=str,
-        default="cfo_swe",
+        default="picfo_swe",
     )
 
     parser.add_argument(
@@ -320,7 +370,9 @@ def _build_spline_dataset(
     )
 
     # ------------------------------------------------------------
-    # If full trajectories are used, build uniform normalized time.
+    # Full trajectory -> uniform normalized time.
+    #
+    # Partial trajectory -> use true selected timestamps.
     # ------------------------------------------------------------
 
     if time is None:
@@ -339,7 +391,7 @@ def _build_spline_dataset(
         )
 
     # ------------------------------------------------------------
-    # Construct spline coefficients.
+    # Construct temporal spline.
     # ------------------------------------------------------------
 
     if spline_type == "linear":
@@ -366,7 +418,7 @@ def _build_spline_dataset(
         )
 
     # ------------------------------------------------------------
-    # Build shuffled repeated training dataloader.
+    # Build training dataloader.
     # ------------------------------------------------------------
 
     return build_dataloader(
@@ -388,7 +440,7 @@ def main() -> None:
     args = parse_args()
 
     # ============================================================
-    # GLOBAL TRAINING SEED
+    # GLOBAL MODEL/TRAINING SEED
     # ============================================================
 
     set_global_seed(
@@ -396,7 +448,8 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------
-    # Current flat-bed experiment has no external condition.
+    # Current flat-bed PI-CFO experiment is unconditioned.
+    # Bathymetry conditioning comes later.
     # ------------------------------------------------------------
 
     use_condition = False
@@ -464,8 +517,7 @@ def main() -> None:
             ratio=args.partial_train_ratio,
 
             # ----------------------------------------------------
-            # IMPORTANT:
-            # snapshot selection is now independent of model seed.
+            # IMPORTANT PHASE-40 CHANGE
             # ----------------------------------------------------
             seed=args.partial_data_seed,
         )
@@ -475,21 +527,18 @@ def main() -> None:
     )
 
     # ============================================================
-    # MODEL INPUT SHAPE
+    # INPUT SHAPE
     # ============================================================
 
     input_shape = tuple(
         train_data.shape[2:]
     )
 
-    # For our full-state SWE dataset:
+    # Expected:
     #
     # (32, 32, 3)
     #
-    # channels:
-    # 0 = h
-    # 1 = hu
-    # 2 = hv
+    # q = [h, hu, hv]
 
     # ============================================================
     # BUILD MODEL
@@ -516,7 +565,7 @@ def main() -> None:
     )
 
     print(
-        "CFO TASK SUMMARY"
+        "PHYSICS-INFORMED CFO TASK SUMMARY"
     )
 
     print(
@@ -569,6 +618,23 @@ def main() -> None:
     )
 
     print(
+        f"lambda_PDE: "
+        f"{args.lambda_pde}"
+    )
+
+    print(
+        f"dx: {args.dx}"
+    )
+
+    print(
+        f"dy: {args.dy}"
+    )
+
+    print(
+        f"gravity: {args.gravity}"
+    )
+
+    print(
         "========================================\n"
     )
 
@@ -577,7 +643,7 @@ def main() -> None:
     # ============================================================
 
     print(
-        "=== CFO Training Run ==="
+        "=== PI-CFO Training Run ==="
     )
 
     print(
@@ -611,6 +677,11 @@ def main() -> None:
 
     print(
         f"gamma={args.gamma}"
+    )
+
+    print(
+        f"lambda_pde="
+        f"{args.lambda_pde}"
     )
 
     print(
@@ -654,7 +725,7 @@ def main() -> None:
     )
 
     # ============================================================
-    # SPLINE CONSTRUCTION
+    # BUILD TEMPORAL SPLINES
     # ============================================================
 
     print(
@@ -668,10 +739,16 @@ def main() -> None:
         spline_batch_size=args.spline_batch_size,
         epochs=args.epochs,
 
-        # Dataloader shuffle seed remains model/training seed.
+        # --------------------------------------------------------
+        # Model/training seed controls dataloader shuffle.
+        # --------------------------------------------------------
         seed=args.seed,
 
-        # Sparse trajectory timestamps if applicable.
+        # --------------------------------------------------------
+        # If partial data were selected, these are the actual
+        # normalized original timestamps, not a re-uniformized
+        # 0...1 grid over the reduced sequence.
+        # --------------------------------------------------------
         time=train_time,
     )
 
@@ -680,10 +757,10 @@ def main() -> None:
     )
 
     # ============================================================
-    # CFO METHOD
+    # CREATE PI-CFO METHOD
     # ============================================================
 
-    method = ContinuousFlowOperator(
+    method = PhysicsInformedCFO(
         model=model,
         input_shape=input_shape,
         gamma=float(
@@ -691,6 +768,22 @@ def main() -> None:
         ),
         spline_type=args.spline_type,
         use_condition=use_condition,
+
+        lambda_pde=float(
+            args.lambda_pde
+        ),
+
+        dx=float(
+            args.dx
+        ),
+
+        dy=float(
+            args.dy
+        ),
+
+        gravity=float(
+            args.gravity
+        ),
     )
 
     # ============================================================
@@ -752,9 +845,10 @@ def main() -> None:
     )
 
     # ============================================================
-    # VALIDATION DATA
+    # VALIDATION
     #
-    # Validation still uses the FULL trajectory.
+    # Even sparse-data models are evaluated against the full
+    # validation trajectories.
     # ============================================================
 
     eval_dataset = (
@@ -767,7 +861,7 @@ def main() -> None:
     # ============================================================
 
     print(
-        "\nStarting CFO training loop..."
+        "\nStarting PI-CFO training loop..."
     )
 
     train_output = train_cfo(
@@ -802,25 +896,30 @@ def main() -> None:
     # ============================================================
     # FINAL TEST INFERENCE
     #
-    # Test trajectory always remains FULL resolution in time.
+    # IMPORTANT:
+    # Always evaluate on all 51 test snapshots, even when the
+    # model was trained with only ~13 temporal snapshots.
     # ============================================================
 
     print(
-        "\nRunning final test inference..."
+        "\nRunning final PI-CFO "
+        "test inference..."
     )
 
-    test_pred = method.uniform_inference(
-        state_for_test,
-        test_data[:, 0],
-        trajectory_points_num=(
-            test_data.shape[1]
-        ),
-        steps_per_segment=2,
-        method="RK4",
+    test_pred = (
+        method.uniform_inference(
+            state_for_test,
+            test_data[:, 0],
+            trajectory_points_num=(
+                test_data.shape[1]
+            ),
+            steps_per_segment=2,
+            method="RK4",
+        )
     )
 
     # ============================================================
-    # TEST METRICS
+    # FINAL TEST METRICS
     # ============================================================
 
     test_rmse = rmse(
@@ -867,7 +966,8 @@ def main() -> None:
         )
 
         print(
-            f"  epoch={best_epoch}"
+            f"  epoch="
+            f"{best_epoch}"
         )
 
         print(
@@ -885,7 +985,7 @@ def main() -> None:
         )
 
     # ============================================================
-    # FINAL TEST METRICS
+    # FINAL PI-CFO RESULTS
     # ============================================================
 
     print(
@@ -893,7 +993,7 @@ def main() -> None:
     )
 
     print(
-        "FINAL CFO TEST METRICS"
+        "FINAL PI-CFO TEST METRICS"
     )
 
     print(
@@ -914,6 +1014,67 @@ def main() -> None:
         "Relative Frobenius Error: "
         f"{float(test_rel_fro):.6f}"
     )
+
+    # ------------------------------------------------------------
+    # Phase-29 loss-component information, if present.
+    # ------------------------------------------------------------
+
+    if (
+        "total_loss_log"
+        in train_output
+        and
+        len(
+            train_output[
+                "total_loss_log"
+            ]
+        )
+        > 0
+    ):
+
+        print(
+            "\nFinal training losses:"
+        )
+
+        print(
+            "  Total: "
+            f"{train_output['total_loss_log'][-1]:.6e}"
+        )
+
+        print(
+            "  CFO:   "
+            f"{train_output['cfo_loss_log'][-1]:.6e}"
+        )
+
+        if (
+            len(
+                train_output[
+                    "pde_loss_log"
+                ]
+            )
+            > 0
+        ):
+
+            print(
+                "  PDE:   "
+                f"{train_output['pde_loss_log'][-1]:.6e}"
+            )
+
+        if (
+            "weighted_pde_loss_log"
+            in train_output
+            and
+            len(
+                train_output[
+                    "weighted_pde_loss_log"
+                ]
+            )
+            > 0
+        ):
+
+            print(
+                "  Weighted PDE: "
+                f"{train_output['weighted_pde_loss_log'][-1]:.6e}"
+            )
 
     print(
         "========================================"

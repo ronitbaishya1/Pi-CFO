@@ -34,3 +34,41 @@ temp/
 # OS
 .DS_Store
 Thumbs.db
+# ==========================
+# Generated experiment output
+# ==========================
+
+logs/
+results/
+results_old_300/
+
+# Solver / runtime logs
+*.log
+pyclaw.log
+
+# ==========================
+# Model checkpoints
+# ==========================
+
+checkpoints/
+
+# ==========================
+# Python caches
+# ==========================
+
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ==========================
+# Large generated datasets
+# ==========================
+
+*.h5
+*.hdf5
+
+# ==========================
+# macOS
+# ==========================
+
+.DS_Store
