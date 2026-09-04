@@ -31,7 +31,7 @@ def build_model(
 		return FNO1d(num_channels=out_channels, use_condition=use_condition)
 
 	if name_l == "fno2d":
-		return FNO2d(num_channels=out_channels, use_condition=use_condition)
+		return FNO2d(num_channels=out_channels, use_condition=use_condition, use_time=True,)
 
 	if name_l == "dit":
 		out_channels = input_shape[-1] if len(input_shape) >= 3 else 1
