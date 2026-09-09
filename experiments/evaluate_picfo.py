@@ -46,9 +46,10 @@ import os
 from pathlib import Path
 import sys
 
-# -----------------------------------------------------------------
-# Quiet unnecessary TensorFlow / absl output.
-# -----------------------------------------------------------------
+
+# ================================================================
+# QUIET UNNECESSARY TENSORFLOW / ABSL OUTPUT
+# ================================================================
 
 os.environ.setdefault(
     "TF_CPP_MIN_LOG_LEVEL",
@@ -61,9 +62,9 @@ os.environ.setdefault(
 )
 
 
-# -----------------------------------------------------------------
-# Project root
-# -----------------------------------------------------------------
+# ================================================================
+# PROJECT ROOT
+# ================================================================
 
 PROJECT_ROOT = (
     Path(__file__)
@@ -78,11 +79,12 @@ if str(PROJECT_ROOT) not in sys.path:
     )
 
 
-# -----------------------------------------------------------------
-# Imports
-# -----------------------------------------------------------------
+# ================================================================
+# IMPORTS
+# ================================================================
 
 import jax.numpy as jnp
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -128,6 +130,7 @@ EPS = 1e-12
 # ================================================================
 
 def parse_args() -> argparse.Namespace:
+    """Parse evaluation command-line arguments."""
 
     parser = argparse.ArgumentParser(
         description=(
@@ -191,6 +194,14 @@ def parse_args() -> argparse.Namespace:
 
     # ------------------------------------------------------------
     # CFO checkpoint
+    #
+    # IMPORTANT:
+    #
+    # ckpt-dir may point directly to a run, e.g.
+    #
+    # checkpoints/best/fno_cfo_e200_seed0
+    #
+    # Therefore the default prefix is intentionally empty.
     # ------------------------------------------------------------
 
     parser.add_argument(
@@ -202,7 +213,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cfo-ckpt-prefix",
         type=str,
-        default="cfo_main_300",
+        default="",
     )
 
     parser.add_argument(
@@ -224,7 +235,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--picfo-ckpt-prefix",
         type=str,
-        default="picfo_main_300",
+        default="",
     )
 
     parser.add_argument(
@@ -262,14 +273,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ------------------------------------------------------------
-    # Optimizer settings used only to create the TrainState
-    # template before checkpoint restoration.
+    # Optimizer settings
+    #
+    # These are used only to create the TrainState structure before
+    # restoring the stored parameters / optimizer state.
     # ------------------------------------------------------------
 
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-5,
+        default=1e-4,
     )
 
     parser.add_argument(
@@ -345,6 +358,26 @@ def parse_args() -> argparse.Namespace:
 
 
 # ================================================================
+# CHECKPOINT PATH HELPERS
+# ================================================================
+
+def checkpoint_root(
+    ckpt_dir: str,
+    prefix: str,
+) -> Path:
+    """Return the effective checkpoint-manager directory."""
+
+    root = Path(
+        ckpt_dir
+    ).resolve()
+
+    if prefix:
+        root = root / prefix
+
+    return root
+
+
+# ================================================================
 # BASIC METRICS
 # ================================================================
 
@@ -367,7 +400,11 @@ def relative_l2_np(
     return float(
         numerator
         /
-        (denominator + EPS)
+        (
+            denominator
+            +
+            EPS
+        )
     )
 
 
@@ -379,8 +416,14 @@ def channel_relative_l2(
     """Relative L2 error for one SWE state channel."""
 
     return relative_l2_np(
-        target[..., channel],
-        pred[..., channel],
+        target[
+            ...,
+            channel
+        ],
+        pred[
+            ...,
+            channel
+        ],
     )
 
 
@@ -474,6 +517,25 @@ def restore_cfo(
         ).resolve()
     )
 
+    effective_root = checkpoint_root(
+        ckpt_dir,
+        args.cfo_ckpt_prefix,
+    )
+
+    print(
+        "CFO checkpoint root:"
+    )
+
+    print(
+        effective_root
+    )
+
+    if not effective_root.exists():
+        raise FileNotFoundError(
+            "CFO checkpoint directory does not exist:\n"
+            f"{effective_root}"
+        )
+
     state = load_train_state(
         target_state=state_template,
         ckpt_dir=ckpt_dir,
@@ -526,6 +588,25 @@ def restore_picfo(
         ).resolve()
     )
 
+    effective_root = checkpoint_root(
+        ckpt_dir,
+        args.picfo_ckpt_prefix,
+    )
+
+    print(
+        "PI-CFO checkpoint root:"
+    )
+
+    print(
+        effective_root
+    )
+
+    if not effective_root.exists():
+        raise FileNotFoundError(
+            "PI-CFO checkpoint directory does not exist:\n"
+            f"{effective_root}"
+        )
+
     state = load_train_state(
         target_state=state_template,
         ckpt_dir=ckpt_dir,
@@ -553,7 +634,10 @@ def rollout(
 
     prediction = method.uniform_inference(
         state,
-        target[:, 0],
+        target[
+            :,
+            0
+        ],
         trajectory_points_num=(
             target.shape[1]
         ),
@@ -652,26 +736,32 @@ def save_error_vs_time(
             ]
         )
 
-        for i, t in enumerate(times):
+        for i, t in enumerate(
+            times
+        ):
 
             writer.writerow(
                 [
                     float(t),
+
                     float(
                         error_data[
                             "cfo_mean"
                         ][i]
                     ),
+
                     float(
                         error_data[
                             "cfo_std"
                         ][i]
                     ),
+
                     float(
                         error_data[
                             "picfo_mean"
                         ][i]
                     ),
+
                     float(
                         error_data[
                             "picfo_std"
@@ -679,10 +769,6 @@ def save_error_vs_time(
                     ),
                 ]
             )
-
-    # ------------------------------------------------------------
-    # Plot
-    # ------------------------------------------------------------
 
     fig, ax = plt.subplots(
         figsize=(
@@ -775,7 +861,9 @@ def save_error_vs_time(
         dpi=300,
     )
 
-    plt.close(fig)
+    plt.close(
+        fig
+    )
 
 
 # ================================================================
@@ -928,7 +1016,7 @@ def save_mass_outputs(
     )
 
     # ------------------------------------------------------------
-    # CSV: mass drift from initial condition
+    # CSV: mass drift
     # ------------------------------------------------------------
 
     csv_path = (
@@ -942,7 +1030,9 @@ def save_mass_outputs(
         newline="",
     ) as f:
 
-        writer = csv.writer(f)
+        writer = csv.writer(
+            f
+        )
 
         writer.writerow(
             [
@@ -953,25 +1043,36 @@ def save_mass_outputs(
             ]
         )
 
-        for i, t in enumerate(times):
+        for i, t in enumerate(
+            times
+        ):
 
             writer.writerow(
                 [
                     float(t),
+
                     float(
-                        true_drift_mean[i]
+                        true_drift_mean[
+                            i
+                        ]
                     ),
+
                     float(
-                        cfo_drift_mean[i]
+                        cfo_drift_mean[
+                            i
+                        ]
                     ),
+
                     float(
-                        picfo_drift_mean[i]
+                        picfo_drift_mean[
+                            i
+                        ]
                     ),
                 ]
             )
 
     # ------------------------------------------------------------
-    # Figure
+    # Mass drift plot
     # ------------------------------------------------------------
 
     fig, ax = plt.subplots(
@@ -1030,11 +1131,13 @@ def save_mass_outputs(
         dpi=300,
     )
 
-    plt.close(fig)
+    plt.close(
+        fig
+    )
 
-    # ============================================================
-    # MASS ERROR RELATIVE TO GROUND TRUTH
-    # ============================================================
+    # ------------------------------------------------------------
+    # Mass error relative to ground truth
+    # ------------------------------------------------------------
 
     cfo_mass_error = (
         relative_mass_error_vs_truth(
@@ -1071,7 +1174,9 @@ def save_mass_outputs(
         newline="",
     ) as f:
 
-        writer = csv.writer(f)
+        writer = csv.writer(
+            f
+        )
 
         writer.writerow(
             [
@@ -1081,16 +1186,24 @@ def save_mass_outputs(
             ]
         )
 
-        for i, t in enumerate(times):
+        for i, t in enumerate(
+            times
+        ):
 
             writer.writerow(
                 [
                     float(t),
+
                     float(
-                        cfo_mass_error_mean[i]
+                        cfo_mass_error_mean[
+                            i
+                        ]
                     ),
+
                     float(
-                        picfo_mass_error_mean[i]
+                        picfo_mass_error_mean[
+                            i
+                        ]
                     ),
                 ]
             )
@@ -1144,7 +1257,9 @@ def save_mass_outputs(
         dpi=300,
     )
 
-    plt.close(fig)
+    plt.close(
+        fig
+    )
 
     return {
         "true_mass":
@@ -1181,11 +1296,7 @@ def temporal_derivative(
     trajectory: np.ndarray,
     times: np.ndarray,
 ) -> np.ndarray:
-    """Finite-difference temporal derivative.
-
-    Uses NumPy's second-order central finite difference at
-    interior times and one-sided treatment at boundaries.
-    """
+    """Finite-difference temporal derivative."""
 
     edge_order = (
         2
@@ -1208,16 +1319,7 @@ def compute_pde_residual_vs_time(
     dy: float,
     gravity: float,
 ):
-    """Compute SWE residual MSE at every time.
-
-    Returns
-    -------
-    overall:
-        shape (time,)
-
-    channel:
-        shape (time, 3)
-    """
+    """Compute SWE residual MSE at every time."""
 
     q_t = temporal_derivative(
         trajectory,
@@ -1370,7 +1472,9 @@ def save_pde_outputs(
         newline="",
     ) as f:
 
-        writer = csv.writer(f)
+        writer = csv.writer(
+            f
+        )
 
         writer.writerow(
             [
@@ -1390,22 +1494,30 @@ def save_pde_outputs(
             ]
         )
 
-        for i, t in enumerate(times):
+        for i, t in enumerate(
+            times
+        ):
 
             writer.writerow(
                 [
                     float(t),
 
                     float(
-                        truth_overall[i]
+                        truth_overall[
+                            i
+                        ]
                     ),
 
                     float(
-                        cfo_overall[i]
+                        cfo_overall[
+                            i
+                        ]
                     ),
 
                     float(
-                        picfo_overall[i]
+                        picfo_overall[
+                            i
+                        ]
                     ),
 
                     float(
@@ -1516,7 +1628,9 @@ def save_pde_outputs(
         dpi=300,
     )
 
-    plt.close(fig)
+    plt.close(
+        fig
+    )
 
     return {
         "truth_overall":
@@ -1564,7 +1678,9 @@ def nearest_time_indices(
         )
 
         if idx not in indices:
-            indices.append(idx)
+            indices.append(
+                idx
+            )
 
     return indices
 
@@ -1580,18 +1696,7 @@ def save_field_comparison(
     requested_times,
     results_dir,
 ):
-    """Create Phase-36 comparison figure.
-
-    Columns:
-        Ground Truth
-        CFO
-        PI-CFO
-        CFO absolute error
-        PI-CFO absolute error
-
-    Rows:
-        requested time snapshots
-    """
+    """Create spatial field-comparison figure."""
 
     time_indices = nearest_time_indices(
         times,
@@ -1681,10 +1786,6 @@ def save_field_comparison(
             truth_field
         )
 
-        # --------------------------------------------------------
-        # Same state scale for truth/CFO/PI-CFO
-        # --------------------------------------------------------
-
         state_min = min(
             float(
                 np.min(
@@ -1735,10 +1836,6 @@ def save_field_comparison(
             EPS,
         )
 
-        # --------------------------------------------------------
-        # State plots
-        # --------------------------------------------------------
-
         im_truth = axes[
             row_idx,
             0
@@ -1769,10 +1866,6 @@ def save_field_comparison(
             vmax=state_max,
         )
 
-        # --------------------------------------------------------
-        # Error plots
-        # --------------------------------------------------------
-
         im_error = axes[
             row_idx,
             3
@@ -1793,10 +1886,6 @@ def save_field_comparison(
             vmax=error_max,
         )
 
-        # --------------------------------------------------------
-        # Labels
-        # --------------------------------------------------------
-
         axes[
             row_idx,
             0
@@ -1815,16 +1904,16 @@ def save_field_comparison(
             axes[
                 row_idx,
                 col_idx
-            ].set_xticks([])
+            ].set_xticks(
+                []
+            )
 
             axes[
                 row_idx,
                 col_idx
-            ].set_yticks([])
-
-        # --------------------------------------------------------
-        # Colorbars
-        # --------------------------------------------------------
+            ].set_yticks(
+                []
+            )
 
         fig.colorbar(
             im_truth,
@@ -1876,7 +1965,9 @@ def save_field_comparison(
         bbox_inches="tight",
     )
 
-    plt.close(fig)
+    plt.close(
+        fig
+    )
 
 
 # ================================================================
@@ -1892,10 +1983,6 @@ def build_phase37_results(
     pde_outputs,
 ):
     """Build main comparison table."""
-
-    # ------------------------------------------------------------
-    # CFO
-    # ------------------------------------------------------------
 
     cfo_rel_l2 = float(
         relative_L2_error(
@@ -1918,10 +2005,6 @@ def build_phase37_results(
         )
     )
 
-    # ------------------------------------------------------------
-    # PI-CFO
-    # ------------------------------------------------------------
-
     picfo_rel_l2 = float(
         relative_L2_error(
             target,
@@ -1942,10 +2025,6 @@ def build_phase37_results(
             picfo_pred,
         )
     )
-
-    # ------------------------------------------------------------
-    # Channel-wise errors
-    # ------------------------------------------------------------
 
     cfo_channels = [
         channel_relative_l2(
@@ -1969,10 +2048,6 @@ def build_phase37_results(
         )
     ]
 
-    # ------------------------------------------------------------
-    # Mean PDE residual MSE over time
-    # ------------------------------------------------------------
-
     cfo_pde = float(
         np.mean(
             pde_outputs[
@@ -1989,10 +2064,6 @@ def build_phase37_results(
         )
     )
 
-    # ------------------------------------------------------------
-    # Mean relative mass drift
-    # ------------------------------------------------------------
-
     cfo_mass_drift = float(
         np.mean(
             mass_outputs[
@@ -2008,10 +2079,6 @@ def build_phase37_results(
             ]
         )
     )
-
-    # ------------------------------------------------------------
-    # Final-time relative mass drift
-    # ------------------------------------------------------------
 
     cfo_final_mass_drift = float(
         np.mean(
@@ -2044,13 +2111,19 @@ def build_phase37_results(
                 cfo_rel_l2,
 
             "E_h":
-                cfo_channels[0],
+                cfo_channels[
+                    0
+                ],
 
             "E_hu":
-                cfo_channels[1],
+                cfo_channels[
+                    1
+                ],
 
             "E_hv":
-                cfo_channels[2],
+                cfo_channels[
+                    2
+                ],
 
             "PDE_residual_MSE":
                 cfo_pde,
@@ -2076,13 +2149,19 @@ def build_phase37_results(
                 picfo_rel_l2,
 
             "E_h":
-                picfo_channels[0],
+                picfo_channels[
+                    0
+                ],
 
             "E_hu":
-                picfo_channels[1],
+                picfo_channels[
+                    1
+                ],
 
             "E_hv":
-                picfo_channels[2],
+                picfo_channels[
+                    2
+                ],
 
             "PDE_residual_MSE":
                 picfo_pde,
@@ -2146,7 +2225,9 @@ def save_phase37_results(
         writer.writeheader()
 
         for row in results:
-            writer.writerow(row)
+            writer.writerow(
+                row
+            )
 
     # ------------------------------------------------------------
     # Markdown
@@ -2257,8 +2338,13 @@ def save_summary(
         "evaluation_summary.txt"
     )
 
-    cfo = results[0]
-    picfo = results[1]
+    cfo = results[
+        0
+    ]
+
+    picfo = results[
+        1
+    ]
 
     with path.open(
         "w"
@@ -2315,6 +2401,46 @@ def save_summary(
         )
 
         f.write(
+            "CFO checkpoint\n"
+        )
+
+        f.write(
+            "--------------\n"
+        )
+
+        f.write(
+            f"Directory: {args.cfo_ckpt_dir}\n"
+        )
+
+        f.write(
+            f"Prefix: {args.cfo_ckpt_prefix}\n"
+        )
+
+        f.write(
+            f"Step: {args.cfo_ckpt_step}\n\n"
+        )
+
+        f.write(
+            "PI-CFO checkpoint\n"
+        )
+
+        f.write(
+            "-----------------\n"
+        )
+
+        f.write(
+            f"Directory: {args.picfo_ckpt_dir}\n"
+        )
+
+        f.write(
+            f"Prefix: {args.picfo_ckpt_prefix}\n"
+        )
+
+        f.write(
+            f"Step: {args.picfo_ckpt_step}\n\n"
+        )
+
+        f.write(
             "CFO\n"
         )
 
@@ -2325,6 +2451,7 @@ def save_summary(
         for key, value in cfo.items():
 
             if key != "Model":
+
                 f.write(
                     f"{key}: "
                     f"{value:.8e}\n"
@@ -2341,14 +2468,11 @@ def save_summary(
         for key, value in picfo.items():
 
             if key != "Model":
+
                 f.write(
                     f"{key}: "
                     f"{value:.8e}\n"
                 )
-
-        # --------------------------------------------------------
-        # Relative improvement
-        # --------------------------------------------------------
 
         f.write(
             "\nRelative PI-CFO improvement over CFO\n"
@@ -2401,6 +2525,7 @@ def save_summary(
 # ================================================================
 
 def main():
+    """Run complete CFO vs PI-CFO evaluation."""
 
     args = parse_args()
 
@@ -2463,7 +2588,9 @@ def main():
             f"but received {target.shape}."
         )
 
-    if target.shape[-1] != 3:
+    if target.shape[
+        -1
+    ] != 3:
 
         raise ValueError(
             "Expected state channels [h, hu, hv], "
@@ -2471,15 +2598,19 @@ def main():
         )
 
     input_shape = tuple(
-        target.shape[2:]
+        target.shape[
+            2:
+        ]
     )
 
     print(
-        f"Target shape: {target.shape}"
+        f"Target shape: "
+        f"{target.shape}"
     )
 
     print(
-        f"Input shape: {input_shape}"
+        f"Input shape: "
+        f"{input_shape}"
     )
 
     print(
@@ -2499,7 +2630,9 @@ def main():
     times = np.linspace(
         0.0,
         1.0,
-        target.shape[1],
+        target.shape[
+            1
+        ],
         dtype=np.float64,
     )
 
@@ -2613,8 +2746,7 @@ def main():
     )
 
     # ============================================================
-    # PHASE 35:
-    # ERROR VS TIME
+    # PHASE 35 — ERROR VS TIME
     # ============================================================
 
     print(
@@ -2634,8 +2766,7 @@ def main():
     )
 
     # ============================================================
-    # PHASE 34:
-    # MASS DRIFT
+    # PHASE 34 — MASS DRIFT
     # ============================================================
 
     print(
@@ -2653,8 +2784,7 @@ def main():
     )
 
     # ============================================================
-    # PHASE 33:
-    # PDE RESIDUAL
+    # PHASE 33 — PDE RESIDUAL
     # ============================================================
 
     print(
@@ -2673,8 +2803,7 @@ def main():
     )
 
     # ============================================================
-    # PHASE 36:
-    # FIELD COMPARISONS
+    # PHASE 36 — FIELD COMPARISONS
     # ============================================================
 
     print(
@@ -2683,7 +2812,9 @@ def main():
 
     n_field_trajectories = min(
         args.n_field_trajectories,
-        target.shape[0],
+        target.shape[
+            0
+        ],
     )
 
     for trajectory_index in range(
@@ -2714,8 +2845,7 @@ def main():
             )
 
     # ============================================================
-    # PHASE 37:
-    # FINAL TABLE
+    # PHASE 37 — FINAL TABLE
     # ============================================================
 
     print(
@@ -2817,4 +2947,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    

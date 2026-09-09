@@ -19,6 +19,7 @@ def _create_manager(
     max_to_keep: int = 5,
 ) -> ocp.CheckpointManager:
     """Create a configured Orbax checkpoint manager."""
+
     manager_dir = _manager_directory(ckpt_dir, prefix)
     manager_dir.mkdir(parents=True, exist_ok=True)
 
@@ -26,8 +27,11 @@ def _create_manager(
         create=True,
         max_to_keep=max_to_keep,
     )
-    # ✅ refactored API
-    return ocp.CheckpointManager(manager_dir, options=options)
+
+    return ocp.CheckpointManager(
+        manager_dir,
+        options=options,
+    )
 
 
 def save_train_state(
@@ -38,9 +42,20 @@ def save_train_state(
     max_to_keep: int = 5,
 ) -> None:
     """Save training state at a given step."""
+
     step = int(step)
-    with _create_manager(ckpt_dir, prefix, max_to_keep=max_to_keep) as manager:
-        manager.save(step, args=ocp.args.StandardSave(state))
+
+    with _create_manager(
+        ckpt_dir,
+        prefix,
+        max_to_keep=max_to_keep,
+    ) as manager:
+
+        manager.save(
+            step,
+            args=ocp.args.StandardSave(state),
+        )
+
         manager.wait_until_finished()
 
 
@@ -51,14 +66,68 @@ def load_train_state(
     step: Optional[int] = None,
     max_to_keep: int = 5,
 ) -> Any:
-    """Restore training state from a checkpoint step (or latest when omitted)."""
-    with _create_manager(ckpt_dir, prefix, max_to_keep=max_to_keep) as manager:
+    """
+    Restore training state.
+
+    First tries the normal single-item Orbax format.
+    If that fails because the checkpoint contains named items,
+    falls back to Composite(default=...).
+    """
+
+    with _create_manager(
+        ckpt_dir,
+        prefix,
+        max_to_keep=max_to_keep,
+    ) as manager:
+
         if step is None:
             step = manager.latest_step()
+
             if step is None:
                 raise FileNotFoundError(
-                    f"No checkpoints found in '{_manager_directory(ckpt_dir, prefix)}'."
+                    f"No checkpoints found in "
+                    f"'{_manager_directory(ckpt_dir, prefix)}'."
                 )
+
         step = int(step)
 
-        return manager.restore(step, args=ocp.args.StandardRestore(target_state))
+        # -----------------------------------------------------
+        # Attempt 1:
+        # Normal single-item checkpoint.
+        # -----------------------------------------------------
+        try:
+            return manager.restore(
+                step,
+                args=ocp.args.StandardRestore(target_state),
+            )
+
+        except ValueError:
+            # -------------------------------------------------
+            # Attempt 2:
+            # Older/named checkpoint format.
+            # -------------------------------------------------
+            print(
+                "Standard checkpoint restore failed; "
+                "trying Composite(default=...) restore."
+            )
+
+            restored = manager.restore(
+                step,
+                args=ocp.args.Composite(
+                    default=ocp.args.StandardRestore(target_state),
+                ),
+            )
+
+            # Orbax versions may return a dict-like object
+            # or an object with a .default attribute.
+            try:
+                return restored["default"]
+
+            except (TypeError, KeyError):
+                if hasattr(restored, "default"):
+                    return restored.default
+
+            raise RuntimeError(
+                "Composite checkpoint restored, but the "
+                "'default' training state could not be extracted."
+            )
