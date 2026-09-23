@@ -1,26 +1,47 @@
 """
-Train geometry-conditioned Well-Balanced Bed-PI-CFO models.
+Train smooth-tangent-consistent Geometry-U-FNO WB-Bed-PI-CFO.
 
-Available architectures:
-    fno
-    geometry_fno
-    geometry_ufno
-    geometry_ffno
-    geometry_transolver
-    geometry_dit
+Architecture
+------------
 
-Objective:
+    Geometry-U-FNO
 
-    L_total =
-        L_CFO
-        + lambda_PDE * L_PDE
-        + lambda_bed * L_bed
-        + lambda_WB * L_WB
+Established objective
+---------------------
 
-Only the neural-operator backbone changes.
+    L_base
+    =
+    L_CFO
+    +
+    lambda_PDE * L_PDE
+    +
+    lambda_bed * L_bed
+    +
+    lambda_WB * L_WB
 
-CFO, SWE physics, bed-response regularization,
-well-balanced regularization, and RK4 rollout remain unchanged.
+Stage-B objective
+-----------------
+
+    L_total
+    =
+    L_base
+    +
+    lambda_tangent * L_tangent
+
+where
+
+    L_tangent
+
+matches the directional derivative of the neural vector field with
+the directional derivative of the existing discrete well-balanced
+SWE vector field.
+
+Perturbations
+-------------
+
+Stage B uses smooth Gaussian-filtered perturbations because Stage A
+showed that they provide a much more physically relevant tangent
+diagnostic than grid-scale white noise.
 """
 
 from __future__ import annotations
@@ -40,6 +61,10 @@ from jax.tree_util import tree_leaves
 from tqdm.auto import trange
 
 
+# =====================================================================
+# ENVIRONMENT
+# =====================================================================
+
 os.environ.setdefault(
     "TF_CPP_MIN_LOG_LEVEL",
     "3",
@@ -50,6 +75,10 @@ os.environ.setdefault(
     "3",
 )
 
+
+# =====================================================================
+# PROJECT ROOT
+# =====================================================================
 
 PROJECT_ROOT = (
     Path(__file__)
@@ -65,32 +94,16 @@ if str(PROJECT_ROOT) not in sys.path:
     )
 
 
-from models.fno import (
-    FNO2d,
-)
-
-from models.geometry_fno import (
-    GeometryFNO2d,
-)
+# =====================================================================
+# PROJECT IMPORTS
+# =====================================================================
 
 from models.geometry_ufno import (
     GeometryUFNO2d,
 )
 
-from models.geometry_ffno import (
-    GeometryFFNO2d,
-)
-
-from models.geometry_transolver import (
-    GeometryTransolver2d,
-)
-
-from models.geometry_dit import (
-    GeometryDiT2d,
-)
-
-from wb_bathy_bed_pi_cfo import (
-    WellBalancedBathymetryBedPICFO,
+from tangent_wb_bathy_bed_pi_cfo import (
+    TangentConsistentWellBalancedBathymetryBedPICFO,
 )
 
 from train import (
@@ -111,6 +124,10 @@ from utils.checkpoints import (
     save_train_state,
 )
 
+from utils.tangent_swe_bathy import (
+    smooth_tangent_direction,
+)
+
 from scripts.train_wb_bathy_bed_pi_cfo import (
     lambda_name,
     trajectory_time_array,
@@ -128,8 +145,8 @@ def parse_args():
 
     parser = argparse.ArgumentParser(
         description=(
-            "Train geometry-conditioned "
-            "WB-Bed-PI-CFO models."
+            "Train smooth-tangent-consistent "
+            "Geometry-U-FNO WB-Bed-PI-CFO."
         )
     )
 
@@ -159,24 +176,9 @@ def parse_args():
     )
 
     # -----------------------------------------------------------------
-    # ARCHITECTURE
+    # GEOMETRY-U-FNO
     # -----------------------------------------------------------------
 
-    parser.add_argument(
-        "--architecture",
-        type=str,
-        default="geometry_fno",
-        choices=[
-            "fno",
-            "geometry_fno",
-            "geometry_ufno",
-            "geometry_ffno",
-            "geometry_transolver",
-            "geometry_dit",
-        ],
-    )
-
-    # FNO family
     parser.add_argument(
         "--modes1",
         type=int,
@@ -201,7 +203,12 @@ def parse_args():
         default=4,
     )
 
-    # Geometry encoder
+    parser.add_argument(
+        "--num-u-blocks",
+        type=int,
+        default=2,
+    )
+
     parser.add_argument(
         "--geometry-width",
         type=int,
@@ -212,76 +219,6 @@ def parse_args():
         "--geometry-depth",
         type=int,
         default=2,
-    )
-
-    # U-FNO
-    parser.add_argument(
-        "--num-u-blocks",
-        type=int,
-        default=2,
-    )
-
-    # F-FNO
-    parser.add_argument(
-        "--ffno-expansion",
-        type=int,
-        default=2,
-    )
-
-    # -----------------------------------------------------------------
-    # TRANSOLVER
-    # -----------------------------------------------------------------
-
-    parser.add_argument(
-        "--transolver-heads",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
-        "--transolver-slices",
-        type=int,
-        default=32,
-    )
-
-    parser.add_argument(
-        "--transolver-mlp-ratio",
-        type=int,
-        default=2,
-    )
-
-    # -----------------------------------------------------------------
-    # GEOMETRY-DIT
-    # -----------------------------------------------------------------
-
-    parser.add_argument(
-        "--dit-patch-size",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
-        "--dit-hidden-size",
-        type=int,
-        default=256,
-    )
-
-    parser.add_argument(
-        "--dit-depth",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
-        "--dit-heads",
-        type=int,
-        default=4,
-    )
-
-    parser.add_argument(
-        "--dit-mlp-ratio",
-        type=float,
-        default=4.0,
     )
 
     # -----------------------------------------------------------------
@@ -347,7 +284,7 @@ def parse_args():
     )
 
     # -----------------------------------------------------------------
-    # PHYSICS
+    # ESTABLISHED PHYSICS LOSSES
     # -----------------------------------------------------------------
 
     parser.add_argument(
@@ -380,6 +317,32 @@ def parse_args():
         default=1.0,
     )
 
+    # -----------------------------------------------------------------
+    # STAGE-B TANGENT LOSS
+    # -----------------------------------------------------------------
+
+    parser.add_argument(
+        "--lambda-tangent",
+        type=float,
+        default=0.001,
+    )
+
+    parser.add_argument(
+        "--smooth-sigma",
+        type=float,
+        default=1.5,
+    )
+
+    parser.add_argument(
+        "--smooth-kernel-size",
+        type=int,
+        default=7,
+    )
+
+    # -----------------------------------------------------------------
+    # DOMAIN
+    # -----------------------------------------------------------------
+
     parser.add_argument(
         "--x-length",
         type=float,
@@ -390,18 +353,6 @@ def parse_args():
         "--y-length",
         type=float,
         default=5.0,
-    )
-
-    parser.add_argument(
-        "--dx",
-        type=float,
-        default=None,
-    )
-
-    parser.add_argument(
-        "--dy",
-        type=float,
-        default=None,
     )
 
     # -----------------------------------------------------------------
@@ -443,7 +394,7 @@ def parse_args():
 # MODEL
 # =====================================================================
 
-def build_backbone(
+def build_model(
     args,
     *,
     num_channels,
@@ -451,164 +402,24 @@ def build_backbone(
     dy,
 ):
 
-    common = dict(
+    return GeometryUFNO2d(
         num_channels=num_channels,
         modes1=args.modes1,
         modes2=args.modes2,
         width=args.width,
         num_blocks=args.num_blocks,
-    )
-
-    # -----------------------------------------------------------------
-    # STANDARD FNO
-    # -----------------------------------------------------------------
-
-    if args.architecture == "fno":
-
-        return FNO2d(
-            **common,
-            use_condition=True,
-            use_time=True,
-        )
-
-    # -----------------------------------------------------------------
-    # GEOMETRY-FNO
-    # -----------------------------------------------------------------
-
-    if args.architecture == "geometry_fno":
-
-        return GeometryFNO2d(
-            **common,
-            geometry_width=(
-                args.geometry_width
-            ),
-            geometry_depth=(
-                args.geometry_depth
-            ),
-            dx=dx,
-            dy=dy,
-            use_time=True,
-        )
-
-    # -----------------------------------------------------------------
-    # GEOMETRY-U-FNO
-    # -----------------------------------------------------------------
-
-    if args.architecture == "geometry_ufno":
-
-        return GeometryUFNO2d(
-            **common,
-            num_u_blocks=(
-                args.num_u_blocks
-            ),
-            geometry_width=(
-                args.geometry_width
-            ),
-            geometry_depth=(
-                args.geometry_depth
-            ),
-            dx=dx,
-            dy=dy,
-            use_time=True,
-        )
-
-    # -----------------------------------------------------------------
-    # GEOMETRY-F-FNO
-    # -----------------------------------------------------------------
-
-    if args.architecture == "geometry_ffno":
-
-        return GeometryFFNO2d(
-            **common,
-            expansion=(
-                args.ffno_expansion
-            ),
-            geometry_width=(
-                args.geometry_width
-            ),
-            geometry_depth=(
-                args.geometry_depth
-            ),
-            dx=dx,
-            dy=dy,
-            use_time=True,
-        )
-
-    # -----------------------------------------------------------------
-    # GEOMETRY-TRANSOLVER
-    # -----------------------------------------------------------------
-
-    if args.architecture == "geometry_transolver":
-
-        return GeometryTransolver2d(
-            num_channels=(
-                num_channels
-            ),
-            width=(
-                args.width
-            ),
-            num_blocks=(
-                args.num_blocks
-            ),
-            num_heads=(
-                args.transolver_heads
-            ),
-            slice_num=(
-                args.transolver_slices
-            ),
-            mlp_ratio=(
-                args.transolver_mlp_ratio
-            ),
-            geometry_width=(
-                args.geometry_width
-            ),
-            geometry_depth=(
-                args.geometry_depth
-            ),
-            dx=dx,
-            dy=dy,
-            use_time=True,
-        )
-
-    # -----------------------------------------------------------------
-    # GEOMETRY-DIT
-    # -----------------------------------------------------------------
-
-    if args.architecture == "geometry_dit":
-
-        return GeometryDiT2d(
-            num_channels=(
-                num_channels
-            ),
-            patch_size=(
-                args.dit_patch_size
-            ),
-            hidden_size=(
-                args.dit_hidden_size
-            ),
-            depth=(
-                args.dit_depth
-            ),
-            num_heads=(
-                args.dit_heads
-            ),
-            mlp_ratio=(
-                args.dit_mlp_ratio
-            ),
-            geometry_width=(
-                args.geometry_width
-            ),
-            geometry_depth=(
-                args.geometry_depth
-            ),
-            dx=dx,
-            dy=dy,
-            use_time=True,
-        )
-
-    raise ValueError(
-        f"Unsupported architecture: "
-        f"{args.architecture}"
+        num_u_blocks=(
+            args.num_u_blocks
+        ),
+        geometry_width=(
+            args.geometry_width
+        ),
+        geometry_depth=(
+            args.geometry_depth
+        ),
+        dx=dx,
+        dy=dy,
+        use_time=True,
     )
 
 
@@ -620,20 +431,45 @@ def main():
 
     args = parse_args()
 
+    # -----------------------------------------------------------------
+    # VALIDATION
+    # -----------------------------------------------------------------
+
+    if args.lambda_tangent < 0.0:
+
+        raise ValueError(
+            "--lambda-tangent must be >= 0."
+        )
+
+    if args.smooth_sigma <= 0.0:
+
+        raise ValueError(
+            "--smooth-sigma must be > 0."
+        )
+
+    if (
+        args.smooth_kernel_size
+        %
+        2
+        ==
+        0
+    ):
+
+        raise ValueError(
+            "--smooth-kernel-size must be odd."
+        )
+
     np.random.seed(
         args.seed
     )
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # DATA
-    # -----------------------------------------------------------------
+    # =================================================================
 
-    dataset_path = (
-        Path(
-            args.dataset_path
-        )
-        .expanduser()
-    )
+    dataset_path = Path(
+        args.dataset_path
+    ).expanduser()
 
     if not dataset_path.is_absolute():
 
@@ -714,11 +550,6 @@ def main():
 
     dx = (
         float(
-            args.dx
-        )
-        if args.dx is not None
-        else
-        float(
             args.x_length
         )
         /
@@ -727,23 +558,32 @@ def main():
 
     dy = (
         float(
-            args.dy
-        )
-        if args.dy is not None
-        else
-        float(
             args.y_length
         )
         /
         ny
     )
 
-    # -----------------------------------------------------------------
-    # OUTPUT DIRECTORIES
-    # -----------------------------------------------------------------
+    # =================================================================
+    # UNIQUE OUTPUT DIRECTORIES
+    #
+    # Avoid checkpoint collisions between tangent weights.
+    # =================================================================
 
-    lam_wb = lambda_name(
-        args.lambda_wb
+    tangent_name = lambda_name(
+        args.lambda_tangent
+    )
+
+    experiment_name = (
+        "smooth_sigma"
+        +
+        lambda_name(
+            args.smooth_sigma
+        )
+        +
+        "_lamtan_"
+        +
+        tangent_name
     )
 
     default_ckpt_dir = (
@@ -751,13 +591,13 @@ def main():
         /
         "checkpoints"
         /
-        "geometry_wb_bed_pi"
+        "tangent_wb_bed_pi"
         /
-        args.architecture
+        "geometry_ufno"
         /
         f"res{nx}"
         /
-        f"lamwb_{lam_wb}"
+        experiment_name
         /
         f"seed{args.seed}"
     )
@@ -767,38 +607,48 @@ def main():
         /
         "results"
         /
-        "geometry_wb_bed_pi"
+        "tangent_wb_bed_pi"
         /
-        args.architecture
+        "geometry_ufno"
         /
         f"res{nx}"
         /
-        f"lamwb_{lam_wb}"
+        experiment_name
         /
         f"seed{args.seed}"
     )
 
-    ckpt_dir = (
-        default_ckpt_dir.resolve()
-        if args.ckpt_dir is None
-        else
-        Path(
-            args.ckpt_dir
-        )
-        .expanduser()
-        .resolve()
-    )
+    if args.ckpt_dir is None:
 
-    results_dir = (
-        default_results_dir.resolve()
-        if args.results_dir is None
-        else
-        Path(
-            args.results_dir
+        ckpt_dir = (
+            default_ckpt_dir.resolve()
         )
-        .expanduser()
-        .resolve()
-    )
+
+    else:
+
+        ckpt_dir = (
+            Path(
+                args.ckpt_dir
+            )
+            .expanduser()
+            .resolve()
+        )
+
+    if args.results_dir is None:
+
+        results_dir = (
+            default_results_dir.resolve()
+        )
+
+    else:
+
+        results_dir = (
+            Path(
+                args.results_dir
+            )
+            .expanduser()
+            .resolve()
+        )
 
     ckpt_dir.mkdir(
         parents=True,
@@ -810,28 +660,100 @@ def main():
         exist_ok=True,
     )
 
-    # -----------------------------------------------------------------
-    # INFO
-    # -----------------------------------------------------------------
+    # =================================================================
+    # SPLINE DATALOADER
+    # =================================================================
+
+    loader = (
+        build_conditioned_spline_loader(
+            train_q,
+            train_b,
+            train_time,
+            args=args,
+        )
+    )
+
+    # =================================================================
+    # MODEL
+    # =================================================================
+
+    model = build_model(
+        args,
+        num_channels=(
+            input_shape[
+                -1
+            ]
+        ),
+        dx=dx,
+        dy=dy,
+    )
+
+    method = (
+        TangentConsistentWellBalancedBathymetryBedPICFO(
+            model=model,
+            input_shape=input_shape,
+            condition_shape=(
+                condition_shape
+            ),
+            gamma=args.gamma,
+            spline_type=(
+                args.spline_type
+            ),
+            lambda_pde=(
+                args.lambda_pde
+            ),
+            lambda_bed=(
+                args.lambda_bed
+            ),
+            lambda_wb=(
+                args.lambda_wb
+            ),
+            lambda_tangent=(
+                args.lambda_tangent
+            ),
+            wb_eta0=(
+                args.wb_eta0
+            ),
+            dx=dx,
+            dy=dy,
+            gravity=(
+                args.gravity
+            ),
+        )
+    )
+
+    state = init_cfo_train_state(
+        method,
+        seed=args.seed,
+        learning_rate=args.lr,
+        beta1=args.beta1,
+        beta2=args.beta2,
+    )
+
+    parameter_count = sum(
+        leaf.size
+        for leaf
+        in tree_leaves(
+            state.params
+        )
+    )
+
+    # =================================================================
+    # INFORMATION
+    # =================================================================
 
     print()
 
     print(
-        "=" * 70
+        "=" * 72
     )
 
     print(
-        "GEOMETRY-CONDITIONED "
-        "WB-BED-PI-CFO"
+        "SMOOTH-TANGENT GEOMETRY-U-FNO WB-BED-PI-CFO"
     )
 
     print(
-        "=" * 70
-    )
-
-    print(
-        "Architecture:",
-        args.architecture,
+        "=" * 72
     )
 
     print(
@@ -845,14 +767,11 @@ def main():
     )
 
     print(
-        "dx:",
-        dx,
+        "Parameters:",
+        f"{parameter_count:,}",
     )
 
-    print(
-        "dy:",
-        dy,
-    )
+    print()
 
     print(
         "lambda_PDE:",
@@ -869,215 +788,40 @@ def main():
         args.lambda_wb,
     )
 
-    if (
-        args.architecture
-        ==
-        "geometry_transolver"
-    ):
+    print(
+        "lambda_tangent:",
+        args.lambda_tangent,
+    )
 
-        print(
-            "Transolver heads:",
-            args.transolver_heads,
-        )
-
-        print(
-            "Transolver slices:",
-            args.transolver_slices,
-        )
-
-        print(
-            "Transolver MLP ratio:",
-            args.transolver_mlp_ratio,
-        )
-
-    if (
-        args.architecture
-        ==
-        "geometry_dit"
-    ):
-
-        if (
-            nx
-            %
-            args.dit_patch_size
-            !=
-            0
-            or
-            ny
-            %
-            args.dit_patch_size
-            !=
-            0
-        ):
-
-            raise ValueError(
-                "Dataset resolution must be "
-                "divisible by --dit-patch-size."
-            )
-
-        print(
-            "DiT patch size:",
-            args.dit_patch_size,
-        )
-
-        print(
-            "DiT hidden size:",
-            args.dit_hidden_size,
-        )
-
-        print(
-            "DiT depth:",
-            args.dit_depth,
-        )
-
-        print(
-            "DiT heads:",
-            args.dit_heads,
-        )
-
-        print(
-            "DiT MLP ratio:",
-            args.dit_mlp_ratio,
-        )
-
-        print(
-            "DiT tokens:",
-            (
-                nx
-                //
-                args.dit_patch_size
-            )
-            *
-            (
-                ny
-                //
-                args.dit_patch_size
-            ),
-        )
+    print()
 
     print(
-        "=" * 70
-    )
-
-    # -----------------------------------------------------------------
-    # CFO SPLINE DATA
-    # -----------------------------------------------------------------
-
-    loader = (
-        build_conditioned_spline_loader(
-            train_q,
-            train_b,
-            train_time,
-            args=args,
-        )
-    )
-
-    # -----------------------------------------------------------------
-    # BACKBONE
-    # -----------------------------------------------------------------
-
-    model = build_backbone(
-        args,
-        num_channels=(
-            input_shape[
-                -1
-            ]
-        ),
-        dx=dx,
-        dy=dy,
-    )
-
-    # -----------------------------------------------------------------
-    # SAME WB-BED-PI-CFO
-    # -----------------------------------------------------------------
-
-    method = (
-        WellBalancedBathymetryBedPICFO(
-            model=model,
-            input_shape=input_shape,
-            condition_shape=(
-                condition_shape
-            ),
-            gamma=(
-                args.gamma
-            ),
-            spline_type=(
-                args.spline_type
-            ),
-            lambda_pde=(
-                args.lambda_pde
-            ),
-            lambda_bed=(
-                args.lambda_bed
-            ),
-            lambda_wb=(
-                args.lambda_wb
-            ),
-            wb_eta0=(
-                args.wb_eta0
-            ),
-            dx=dx,
-            dy=dy,
-            gravity=(
-                args.gravity
-            ),
-        )
-    )
-
-    state = init_cfo_train_state(
-        method,
-        seed=(
-            args.seed
-        ),
-        learning_rate=(
-            args.lr
-        ),
-        beta1=(
-            args.beta1
-        ),
-        beta2=(
-            args.beta2
-        ),
-    )
-
-    parameter_count = sum(
-        leaf.size
-        for leaf
-        in tree_leaves(
-            state.params
-        )
+        "Smooth sigma:",
+        args.smooth_sigma,
+        "cells",
     )
 
     print(
-        "Model parameters:",
-        f"{parameter_count:,}",
+        "Smooth kernel:",
+        (
+            f"{args.smooth_kernel_size}"
+            " x "
+            f"{args.smooth_kernel_size}"
+        ),
     )
 
-    # -----------------------------------------------------------------
+    print(
+        "=" * 72
+    )
+
+    # =================================================================
     # LOSS
-    # -----------------------------------------------------------------
+    # =================================================================
 
     def loss_with_aux(
         params,
         batch,
     ):
-
-        components = (
-            method.loss_components(
-                params,
-                batch,
-            )
-        )
-
-        if len(
-            components
-        ) != 5:
-
-            raise RuntimeError(
-                "Expected loss_components() "
-                "to return "
-                "(total, CFO, PDE, bed, WB)."
-            )
 
         (
             total,
@@ -1085,7 +829,13 @@ def main():
             pde,
             bed,
             wb,
-        ) = components
+            tangent,
+            tangent_cosine,
+            tangent_gain_ratio,
+        ) = method.loss_components(
+            params,
+            batch,
+        )
 
         return (
             total,
@@ -1094,6 +844,9 @@ def main():
                 pde,
                 bed,
                 wb,
+                tangent,
+                tangent_cosine,
+                tangent_gain_ratio,
             ),
         )
 
@@ -1105,7 +858,15 @@ def main():
         (
             (
                 total,
-                aux,
+                (
+                    cfo,
+                    pde,
+                    bed,
+                    wb,
+                    tangent,
+                    tangent_cosine,
+                    tangent_gain_ratio,
+                ),
             ),
             grads,
         ) = value_and_grad(
@@ -1116,17 +877,8 @@ def main():
             batch,
         )
 
-        (
-            cfo,
-            pde,
-            bed,
-            wb,
-        ) = aux
-
-        state = (
-            state.apply_gradients(
-                grads=grads
-            )
+        state = state.apply_gradients(
+            grads=grads
         )
 
         return (
@@ -1136,15 +888,18 @@ def main():
             pde,
             bed,
             wb,
+            tangent,
+            tangent_cosine,
+            tangent_gain_ratio,
         )
 
     train_step_jit = jax.jit(
         train_step
     )
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # DATA PIPELINE
-    # -----------------------------------------------------------------
+    # =================================================================
 
     data = map(
         prepare_tf_data,
@@ -1156,9 +911,9 @@ def main():
         2,
     )
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # HISTORY
-    # -----------------------------------------------------------------
+    # =================================================================
 
     total_history = []
 
@@ -1169,6 +924,12 @@ def main():
     bed_history = []
 
     wb_history = []
+
+    tangent_history = []
+
+    tangent_cosine_history = []
+
+    tangent_gain_ratio_history = []
 
     validation_epochs = []
 
@@ -1190,15 +951,13 @@ def main():
         args.seed
     )
 
-    # -----------------------------------------------------------------
-    # TRAINING
-    # -----------------------------------------------------------------
+    # =================================================================
+    # TRAIN
+    # =================================================================
 
     progress = trange(
         args.epochs,
-        desc=(
-            args.architecture
-        ),
+        desc="tangent_geometry_ufno",
     )
 
     for epoch in progress:
@@ -1206,26 +965,94 @@ def main():
         (
             rng_key,
             time_key,
-            noise_key,
+            cfo_noise_key,
+            tangent_noise_key,
         ) = jax.random.split(
             rng_key,
-            3,
+            4,
         )
 
         raw_batch = next(
             data
         )
 
-        batch = (
+        # -------------------------------------------------------------
+        # Existing 6-element CFO/WB batch.
+        # -------------------------------------------------------------
+
+        base_batch = (
             prepare_training_batch(
                 raw_batch,
-                time_key=(
-                    time_key
-                ),
-                noise_key=(
-                    noise_key
+                time_key=time_key,
+                noise_key=cfo_noise_key,
+            )
+        )
+
+        spline_coef = (
+            base_batch[
+                0
+            ]
+        )
+
+        # -------------------------------------------------------------
+        # State shape:
+        #
+        # (B,H,W,3)
+        #
+        # spline_coef is:
+        #
+        # (B,6,H,W,3)
+        #
+        # for quintic splines.
+        # -------------------------------------------------------------
+
+        tangent_shape = (
+            spline_coef[
+                :,
+                0,
+            ]
+            .shape
+        )
+
+        # -------------------------------------------------------------
+        # RAW GAUSSIAN FIELD
+        # -------------------------------------------------------------
+
+        raw_tangent_noise = (
+            jax.random.normal(
+                tangent_noise_key,
+                tangent_shape,
+                dtype=(
+                    spline_coef.dtype
                 ),
             )
+        )
+
+        # -------------------------------------------------------------
+        # SMOOTH PHYSICAL PERTURBATION
+        #
+        # Same construction used during Stage-A smooth diagnostic.
+        # -------------------------------------------------------------
+
+        tangent_direction = (
+            smooth_tangent_direction(
+                raw_tangent_noise,
+                sigma=(
+                    args.smooth_sigma
+                ),
+                kernel_size=(
+                    args.smooth_kernel_size
+                ),
+            )
+        )
+
+        # -------------------------------------------------------------
+        # Append tangent direction to the established CFO batch.
+        # -------------------------------------------------------------
+
+        batch = (
+            *base_batch,
+            tangent_direction,
         )
 
         (
@@ -1235,10 +1062,17 @@ def main():
             pde_loss,
             bed_loss,
             wb_loss,
+            tangent_loss,
+            tangent_cosine,
+            tangent_gain_ratio,
         ) = train_step_jit(
             state,
             batch,
         )
+
+        # =============================================================
+        # PYTHON VALUES
+        # =============================================================
 
         total_value = float(
             total_loss
@@ -1260,6 +1094,28 @@ def main():
             wb_loss
         )
 
+        tangent_value = float(
+            tangent_loss
+        )
+
+        tangent_cosine_value = float(
+            tangent_cosine
+        )
+
+        tangent_gain_ratio_value = float(
+            tangent_gain_ratio
+        )
+
+        weighted_tangent_value = (
+            args.lambda_tangent
+            *
+            tangent_value
+        )
+
+        # =============================================================
+        # HISTORY
+        # =============================================================
+
         total_history.append(
             total_value
         )
@@ -1280,6 +1136,22 @@ def main():
             wb_value
         )
 
+        tangent_history.append(
+            tangent_value
+        )
+
+        tangent_cosine_history.append(
+            tangent_cosine_value
+        )
+
+        tangent_gain_ratio_history.append(
+            tangent_gain_ratio_value
+        )
+
+        # =============================================================
+        # PROGRESS
+        # =============================================================
+
         progress.set_postfix(
             total=(
                 f"{total_value:.3e}"
@@ -1296,11 +1168,23 @@ def main():
             wb=(
                 f"{wb_value:.3e}"
             ),
+            tan=(
+                f"{tangent_value:.3e}"
+            ),
+            tan_w=(
+                f"{weighted_tangent_value:.3e}"
+            ),
+            cos=(
+                f"{tangent_cosine_value:.3f}"
+            ),
+            gain=(
+                f"{tangent_gain_ratio_value:.3f}"
+            ),
         )
 
-        # ---------------------------------------------------------
+        # =============================================================
         # VALIDATION
-        # ---------------------------------------------------------
+        # =============================================================
 
         if (
             (
@@ -1364,9 +1248,7 @@ def main():
                     1
                 )
 
-                best_state = (
-                    state
-                )
+                best_state = state
 
                 save_train_state(
                     best_state,
@@ -1396,15 +1278,13 @@ def main():
                 f"{marker}"
             )
 
-    # -----------------------------------------------------------------
-    # FALLBACK IF NO PERIODIC EVALUATION OCCURRED
-    # -----------------------------------------------------------------
+    # =================================================================
+    # FALLBACK
+    # =================================================================
 
     if best_epoch < 0:
 
-        best_state = (
-            state
-        )
+        best_state = state
 
         best_epoch = (
             args.epochs
@@ -1436,9 +1316,9 @@ def main():
             max_to_keep=1,
         )
 
-    # -----------------------------------------------------------------
-    # ID TEST
-    # -----------------------------------------------------------------
+    # =================================================================
+    # FINAL ID TEST — BEST VALIDATION CHECKPOINT
+    # =================================================================
 
     (
         test_l2,
@@ -1453,6 +1333,10 @@ def main():
             args.steps_per_segment
         ),
     )
+
+    # =================================================================
+    # SAVE
+    # =================================================================
 
     np.save(
         results_dir
@@ -1469,19 +1353,19 @@ def main():
         "metrics.npz",
 
         architecture=np.asarray(
-            args.architecture
+            "geometry_ufno"
         ),
 
-        resolution=np.asarray(
-            nx
+        perturbation=np.asarray(
+            "smooth"
         ),
 
-        dx=np.asarray(
-            dx
+        smooth_sigma=np.asarray(
+            args.smooth_sigma
         ),
 
-        dy=np.asarray(
-            dy
+        smooth_kernel_size=np.asarray(
+            args.smooth_kernel_size
         ),
 
         lambda_pde=np.asarray(
@@ -1494,6 +1378,10 @@ def main():
 
         lambda_wb=np.asarray(
             args.lambda_wb
+        ),
+
+        lambda_tangent=np.asarray(
+            args.lambda_tangent
         ),
 
         parameter_count=np.asarray(
@@ -1540,6 +1428,18 @@ def main():
             wb_history
         ),
 
+        tangent_loss=np.asarray(
+            tangent_history
+        ),
+
+        tangent_cosine=np.asarray(
+            tangent_cosine_history
+        ),
+
+        tangent_gain_ratio=np.asarray(
+            tangent_gain_ratio_history
+        ),
+
         validation_epochs=np.asarray(
             validation_epochs
         ),
@@ -1557,33 +1457,40 @@ def main():
         ),
     )
 
-    # -----------------------------------------------------------------
+    # =================================================================
     # FINAL REPORT
-    # -----------------------------------------------------------------
+    # =================================================================
 
     print()
 
     print(
-        "=" * 70
+        "=" * 72
     )
 
     print(
-        "FINAL RESULT"
+        "FINAL STAGE-B RESULT"
     )
 
     print(
-        "=" * 70
+        "=" * 72
     )
 
     print(
         "Architecture:",
-        args.architecture,
+        "geometry_ufno",
     )
 
     print(
-        "Resolution:",
-        f"{nx} x {ny}",
+        "Perturbation:",
+        "smooth",
     )
+
+    print(
+        "lambda_tangent:",
+        args.lambda_tangent,
+    )
+
+    print()
 
     print(
         "Best epoch:",
@@ -1610,6 +1517,25 @@ def main():
         f"{test_fro:.6f}",
     )
 
+    print()
+
+    print(
+        "Final tangent loss:",
+        f"{tangent_history[-1]:.6f}",
+    )
+
+    print(
+        "Final tangent cosine:",
+        f"{tangent_cosine_history[-1]:.6f}",
+    )
+
+    print(
+        "Final tangent gain ratio:",
+        f"{tangent_gain_ratio_history[-1]:.6f}",
+    )
+
+    print()
+
     print(
         "Results:",
         results_dir,
@@ -1617,9 +1543,11 @@ def main():
 
     print(
         "Checkpoint:",
-        ckpt_dir
-        /
-        "best",
+        ckpt_dir,
+    )
+
+    print(
+        "=" * 72
     )
 
 

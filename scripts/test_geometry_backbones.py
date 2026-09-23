@@ -1,16 +1,5 @@
 """
-Smoke-test the geometry-conditioned operator backbones.
-
-Tests:
-
-    GeometryFNO2d
-    GeometryUFNO2d
-    GeometryFFNO2d
-
-at:
-
-    32 x 32
-    64 x 64
+Smoke-test geometry-conditioned operator backbones at 32x32 and 64x64.
 
 No training is performed.
 """
@@ -22,6 +11,7 @@ from pathlib import Path
 
 import jax
 import jax.numpy as jnp
+
 from jax.tree_util import tree_leaves
 
 
@@ -32,6 +22,7 @@ PROJECT_ROOT = (
 )
 
 if str(PROJECT_ROOT) not in sys.path:
+
     sys.path.insert(
         0,
         str(PROJECT_ROOT),
@@ -48,6 +39,14 @@ from models.geometry_ufno import (
 
 from models.geometry_ffno import (
     GeometryFFNO2d,
+)
+
+from models.geometry_transolver import (
+    GeometryTransolver2d,
+)
+
+from models.geometry_dit import (
+    GeometryDiT2d,
 )
 
 
@@ -71,6 +70,7 @@ def build_models(
 ):
 
     return {
+
         "geometry_fno":
             GeometryFNO2d(
                 num_channels=3,
@@ -114,6 +114,36 @@ def build_models(
                 dy=dy,
                 use_time=True,
             ),
+
+        "geometry_transolver":
+            GeometryTransolver2d(
+                num_channels=3,
+                width=32,
+                num_blocks=4,
+                num_heads=4,
+                slice_num=16,
+                mlp_ratio=2,
+                geometry_width=16,
+                geometry_depth=2,
+                dx=dx,
+                dy=dy,
+                use_time=True,
+            ),
+
+        "geometry_dit":
+            GeometryDiT2d(
+                num_channels=3,
+                patch_size=4,
+                hidden_size=256,
+                depth=4,
+                num_heads=4,
+                mlp_ratio=4.0,
+                geometry_width=16,
+                geometry_depth=2,
+                dx=dx,
+                dy=dy,
+                use_time=True,
+            ),
     }
 
 
@@ -122,6 +152,7 @@ def run_resolution_test(
 ):
 
     print()
+
     print(
         "=" * 70
     )
@@ -151,6 +182,10 @@ def run_resolution_test(
 
     batch_size = 2
 
+    # -------------------------------------------------------------
+    # SWE state q = [h,hu,hv]
+    # -------------------------------------------------------------
+
     x = jnp.ones(
         (
             batch_size,
@@ -160,6 +195,10 @@ def run_resolution_test(
         ),
         dtype=jnp.float32,
     )
+
+    # -------------------------------------------------------------
+    # Bathymetry
+    # -------------------------------------------------------------
 
     geometry = jnp.zeros(
         (
@@ -171,7 +210,6 @@ def run_resolution_test(
         dtype=jnp.float32,
     )
 
-    # Add a simple Gaussian geometry field.
     coord = jnp.linspace(
         -2.5,
         2.5,
@@ -210,7 +248,7 @@ def run_resolution_test(
     ].set(
         hill[
             None,
-            ...,
+            ...
         ]
     )
 
@@ -233,6 +271,12 @@ def run_resolution_test(
     ) in enumerate(
         models.items()
     ):
+
+        print()
+
+        print(
+            f"Testing {name}..."
+        )
 
         key = jax.random.PRNGKey(
             100
@@ -284,7 +328,7 @@ def run_resolution_test(
         )
 
         print(
-            f"{name:20s} "
+            f"{name:22s} "
             f"shape={str(output.shape):20s} "
             f"params={count:,}"
         )
@@ -301,10 +345,21 @@ def main():
     )
 
     print()
+
     print(
-        "All geometry-backbone smoke tests passed."
+        "=" * 70
+    )
+
+    print(
+        "All geometry-backbone "
+        "smoke tests passed."
+    )
+
+    print(
+        "=" * 70
     )
 
 
 if __name__ == "__main__":
+
     main()
