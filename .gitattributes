@@ -1,0 +1,5 @@
+
+# Large JAX/Orbax checkpoints
+checkpoints/** filter=lfs diff=lfs merge=lfs -text
+checkpoints/.gitkeep !filter !diff !merge text
+checkpoints/**/.gitkeep !filter !diff !merge text
