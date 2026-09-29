@@ -1,27 +1,64 @@
 """
 Geometry-conditioned 2D U-FNO-style backbone.
 
-Architecture:
+Architecture
+------------
+state/raw geometry
+       |
+    lifting
+       +
+geometry encoder
+       |
+    latent z
+       |
+standard FNO blocks
+       |
+U-FNO blocks:
+    spectral
+    + pointwise
+    + mini U-Net
+       |
+   projection
 
-    state/raw geometry
-           |
-        lifting
-           +
-    geometry encoder
-           |
-        latent z
-           |
-    standard FNO blocks
-           |
-    U-FNO blocks:
-        spectral
-        + pointwise
-        + mini U-Net
-           |
-       projection
 
-This is a 2D adaptation of the U-FNO concept for the present
-continuous-time CFO vector-field setting.
+Cross-resolution inference
+--------------------------
+For a model trained at 64x64 and evaluated at 128x128, the local
+U-Net branch can optionally be evaluated at its original 64x64
+resolution.
+
+Example:
+
+    128 latent
+        |
+        v
+    area downsample
+        |
+        v
+    64 latent
+        |
+        v
+    trained U-Net
+        |
+        v
+    interpolation to 128
+        |
+        v
+    combine with 128 Fourier branch
+
+The reconstruction method can be selected:
+
+    linear
+    cubic
+    lanczos3
+
+An optional small contribution from the native-resolution U-Net
+response may also be blended into the canonical response.
+
+No additional learned parameters are introduced.
+
+If all cross-resolution options are left at their defaults, this
+class behaves like the original Geometry-U-FNO.
 """
 
 from __future__ import annotations
@@ -30,6 +67,9 @@ from typing import Optional
 
 import jax.nn as jnn
 import jax.numpy as jnp
+
+from jax import image as jimage
+
 from flax import linen as nn
 
 from models.fno import (
@@ -44,15 +84,405 @@ from models.geometry_encoder import (
 
 
 # =====================================================================
+# RESOLUTION HELPERS
+# =====================================================================
+
+VALID_RESIZE_METHODS = {
+    "linear",
+    "cubic",
+    "lanczos3",
+    "lanczos5",
+}
+
+
+def downsample_to_resolution(
+    x: jnp.ndarray,
+    target_height: int,
+    target_width: int,
+    *,
+    method: str = "area",
+) -> jnp.ndarray:
+    """
+    Downsample a spatial field.
+
+    method="area"
+    -------------
+    For integer ratios such as 128 -> 64, perform exact block
+    averaging.
+
+    This is the preferred anti-aliased downsampling method for the
+    present zero-shot experiment.
+
+    Other supported methods:
+        linear
+        cubic
+        lanczos3
+        lanczos5
+    """
+
+    (
+        batch,
+        height,
+        width,
+        channels,
+    ) = x.shape
+
+    target_height = int(
+        target_height
+    )
+
+    target_width = int(
+        target_width
+    )
+
+    # -----------------------------------------------------------------
+    # NO RESIZE NEEDED
+    # -----------------------------------------------------------------
+
+    if (
+        height == target_height
+        and
+        width == target_width
+    ):
+
+        return x
+
+    # -----------------------------------------------------------------
+    # AREA / BLOCK AVERAGE
+    # -----------------------------------------------------------------
+
+    if method == "area":
+
+        if (
+            height >= target_height
+            and
+            width >= target_width
+            and
+            height % target_height == 0
+            and
+            width % target_width == 0
+        ):
+
+            scale_h = (
+                height
+                //
+                target_height
+            )
+
+            scale_w = (
+                width
+                //
+                target_width
+            )
+
+            reshaped = jnp.reshape(
+                x,
+                (
+                    batch,
+                    target_height,
+                    scale_h,
+                    target_width,
+                    scale_w,
+                    channels,
+                ),
+            )
+
+            return jnp.mean(
+                reshaped,
+                axis=(
+                    2,
+                    4,
+                ),
+            )
+
+        # -------------------------------------------------------------
+        # GENERAL FALLBACK IF THE RATIO IS NOT INTEGER
+        # -------------------------------------------------------------
+
+        return jimage.resize(
+            x,
+            (
+                batch,
+                target_height,
+                target_width,
+                channels,
+            ),
+            method="linear",
+        )
+
+    # -----------------------------------------------------------------
+    # JAX INTERPOLATION
+    # -----------------------------------------------------------------
+
+    if method not in VALID_RESIZE_METHODS:
+
+        raise ValueError(
+            "Unknown downsample method "
+            f"'{method}'."
+        )
+
+    return jimage.resize(
+        x,
+        (
+            batch,
+            target_height,
+            target_width,
+            channels,
+        ),
+        method=method,
+    )
+
+
+def upsample_to_resolution(
+    x: jnp.ndarray,
+    target_height: int,
+    target_width: int,
+    *,
+    method: str = "linear",
+) -> jnp.ndarray:
+    """
+    Upsample a spatial field.
+
+    Supported methods:
+        linear
+        cubic
+        lanczos3
+        lanczos5
+    """
+
+    (
+        batch,
+        height,
+        width,
+        channels,
+    ) = x.shape
+
+    target_height = int(
+        target_height
+    )
+
+    target_width = int(
+        target_width
+    )
+
+    if (
+        height == target_height
+        and
+        width == target_width
+    ):
+
+        return x
+
+    if method not in VALID_RESIZE_METHODS:
+
+        raise ValueError(
+            "Unknown upsample method "
+            f"'{method}'."
+        )
+
+    return jimage.resize(
+        x,
+        (
+            batch,
+            target_height,
+            target_width,
+            channels,
+        ),
+        method=method,
+    )
+
+
+# =====================================================================
+# OPTIONAL SOURCE-RESOLUTION SPECTRAL FILTER
+#
+# Kept for previous experiments.
+# It will remain OFF in the current resampling comparison.
+# =====================================================================
+
+def _frequency_taper(
+    size: int,
+    source_resolution: int,
+    taper_start: float,
+    dtype,
+) -> jnp.ndarray:
+
+    if source_resolution >= size:
+
+        return jnp.ones(
+            size,
+            dtype=dtype,
+        )
+
+    frequency = jnp.abs(
+        jnp.fft.fftfreq(
+            size
+        )
+    )
+
+    source_nyquist = (
+        0.5
+        *
+        float(
+            source_resolution
+        )
+        /
+        float(
+            size
+        )
+    )
+
+    passband = (
+        float(
+            taper_start
+        )
+        *
+        source_nyquist
+    )
+
+    denominator = max(
+        source_nyquist
+        -
+        passband,
+        1.0e-12,
+    )
+
+    transition = jnp.clip(
+        (
+            frequency
+            -
+            passband
+        )
+        /
+        denominator,
+        0.0,
+        1.0,
+    )
+
+    cosine_taper = (
+        0.5
+        *
+        (
+            1.0
+            +
+            jnp.cos(
+                jnp.pi
+                *
+                transition
+            )
+        )
+    )
+
+    weights = jnp.where(
+        frequency
+        <=
+        passband,
+        1.0,
+        cosine_taper,
+    )
+
+    weights = jnp.where(
+        frequency
+        >=
+        source_nyquist,
+        0.0,
+        weights,
+    )
+
+    return weights.astype(
+        dtype
+    )
+
+
+def source_resolution_projection(
+    field: jnp.ndarray,
+    *,
+    source_resolution: int,
+    taper_start: float = 0.85,
+) -> jnp.ndarray:
+
+    (
+        _,
+        height,
+        width,
+        _,
+    ) = field.shape
+
+    source_resolution = int(
+        source_resolution
+    )
+
+    if (
+        height <= source_resolution
+        and
+        width <= source_resolution
+    ):
+
+        return field
+
+    wx = _frequency_taper(
+        height,
+        source_resolution,
+        taper_start,
+        field.dtype,
+    )
+
+    wy = _frequency_taper(
+        width,
+        source_resolution,
+        taper_start,
+        field.dtype,
+    )
+
+    window = (
+        wx[
+            None,
+            :,
+            None,
+            None,
+        ]
+        *
+        wy[
+            None,
+            None,
+            :,
+            None,
+        ]
+    )
+
+    field_fft = jnp.fft.fft2(
+        field,
+        axes=(
+            1,
+            2,
+        ),
+        norm="ortho",
+    )
+
+    filtered_fft = (
+        field_fft
+        *
+        window
+    )
+
+    filtered = jnp.fft.ifft2(
+        filtered_fft,
+        axes=(
+            1,
+            2,
+        ),
+        norm="ortho",
+    ).real
+
+    return filtered.astype(
+        field.dtype
+    )
+
+
+# =====================================================================
 # MINI U-NET
 # =====================================================================
 
 class MiniUNet2d(nn.Module):
-    """
-    Two-level U-Net branch used inside U-FNO blocks.
-
-    Works naturally on 32x32 and 64x64 grids.
-    """
 
     width: int
 
@@ -73,13 +503,16 @@ class MiniUNet2d(nn.Module):
                 "dimensions to be divisible by 4."
             )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
         # LEVEL 0
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
 
         x0 = nn.Conv(
             self.width,
-            kernel_size=(3, 3),
+            kernel_size=(
+                3,
+                3,
+            ),
             padding="SAME",
             name="input_conv",
         )(
@@ -90,14 +523,20 @@ class MiniUNet2d(nn.Module):
             x0
         )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
         # DOWN 1
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
 
         d1 = nn.Conv(
             self.width,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+            kernel_size=(
+                3,
+                3,
+            ),
+            strides=(
+                2,
+                2,
+            ),
             padding="SAME",
             name="down_1",
         )(
@@ -110,7 +549,10 @@ class MiniUNet2d(nn.Module):
 
         d1 = nn.Conv(
             self.width,
-            kernel_size=(3, 3),
+            kernel_size=(
+                3,
+                3,
+            ),
             padding="SAME",
             name="down_1_refine",
         )(
@@ -121,14 +563,20 @@ class MiniUNet2d(nn.Module):
             d1
         )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
         # DOWN 2
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
 
         d2 = nn.Conv(
             self.width,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+            kernel_size=(
+                3,
+                3,
+            ),
+            strides=(
+                2,
+                2,
+            ),
             padding="SAME",
             name="down_2",
         )(
@@ -141,7 +589,10 @@ class MiniUNet2d(nn.Module):
 
         d2 = nn.Conv(
             self.width,
-            kernel_size=(3, 3),
+            kernel_size=(
+                3,
+                3,
+            ),
             padding="SAME",
             name="bottleneck",
         )(
@@ -152,14 +603,20 @@ class MiniUNet2d(nn.Module):
             d2
         )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
         # UP 1
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
 
         u1 = nn.ConvTranspose(
             self.width,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+            kernel_size=(
+                3,
+                3,
+            ),
+            strides=(
+                2,
+                2,
+            ),
             padding="SAME",
             name="up_1",
         )(
@@ -167,10 +624,17 @@ class MiniUNet2d(nn.Module):
         )
 
         if (
-            u1.shape[1:3]
+            u1.shape[
+                1:
+                3
+            ]
             !=
-            d1.shape[1:3]
+            d1.shape[
+                1:
+                3
+            ]
         ):
+
             raise ValueError(
                 "Unexpected U-Net shape mismatch "
                 "at first skip connection."
@@ -182,14 +646,20 @@ class MiniUNet2d(nn.Module):
             d1
         )
 
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
         # UP 2
-        # ---------------------------------------------------------
+        # -----------------------------------------------------------------
 
         u2 = nn.ConvTranspose(
             self.width,
-            kernel_size=(3, 3),
-            strides=(2, 2),
+            kernel_size=(
+                3,
+                3,
+            ),
+            strides=(
+                2,
+                2,
+            ),
             padding="SAME",
             name="up_2",
         )(
@@ -197,10 +667,17 @@ class MiniUNet2d(nn.Module):
         )
 
         if (
-            u2.shape[1:3]
+            u2.shape[
+                1:
+                3
+            ]
             !=
-            x0.shape[1:3]
+            x0.shape[
+                1:
+                3
+            ]
         ):
+
             raise ValueError(
                 "Unexpected U-Net shape mismatch "
                 "at second skip connection."
@@ -214,7 +691,10 @@ class MiniUNet2d(nn.Module):
 
         return nn.Conv(
             self.width,
-            kernel_size=(1, 1),
+            kernel_size=(
+                1,
+                1,
+            ),
             padding="SAME",
             name="output_projection",
         )(
@@ -227,12 +707,6 @@ class MiniUNet2d(nn.Module):
 # =====================================================================
 
 class GeometryUFNO2d(nn.Module):
-    """
-    Geometry-conditioned U-FNO-style neural operator.
-
-    The first blocks are standard FNO blocks.
-    The last num_u_blocks also include a mini U-Net path.
-    """
 
     num_channels: int
 
@@ -240,8 +714,8 @@ class GeometryUFNO2d(nn.Module):
     modes2: int = 12
 
     width: int = 64
-    num_blocks: int = 4
 
+    num_blocks: int = 4
     num_u_blocks: int = 2
 
     geometry_width: int = 16
@@ -253,6 +727,46 @@ class GeometryUFNO2d(nn.Module):
     include_gradient_magnitude: bool = False
 
     use_time: bool = True
+
+    # -----------------------------------------------------------------
+    # CANONICAL LOCAL BRANCH
+    # -----------------------------------------------------------------
+
+    canonical_unet_resolution: Optional[int] = None
+
+    canonical_geometry_resolution: Optional[int] = None
+
+    canonical_downsample_mode: str = "area"
+
+    canonical_upsample_mode: str = "linear"
+
+    # -----------------------------------------------------------------
+    # OPTIONAL NATIVE-U-NET BLEND
+    #
+    # 0.0 = pure canonical response
+    # 0.1 = 90% canonical + 10% native response
+    # -----------------------------------------------------------------
+
+    canonical_native_blend: float = 0.0
+
+    # -----------------------------------------------------------------
+    # OPTIONAL FINAL VECTOR-FIELD FILTER
+    # -----------------------------------------------------------------
+
+    source_resolution_filter: Optional[int] = None
+
+    filter_taper_start: float = 0.85
+
+    # -----------------------------------------------------------------
+    # PHYSICAL DOMAIN
+    # -----------------------------------------------------------------
+
+    domain_length_x: float = 5.0
+    domain_length_y: float = 5.0
+
+    # =================================================================
+    # SETUP
+    # =================================================================
 
     def setup(
         self,
@@ -271,22 +785,169 @@ class GeometryUFNO2d(nn.Module):
                 "0 <= num_u_blocks <= num_blocks."
             )
 
+        # -----------------------------------------------------------------
+        # CANONICAL U-NET VALIDATION
+        # -----------------------------------------------------------------
+
+        if (
+            self.canonical_unet_resolution
+            is not None
+        ):
+
+            canonical = int(
+                self.canonical_unet_resolution
+            )
+
+            if canonical < 4:
+
+                raise ValueError(
+                    "canonical_unet_resolution "
+                    "must be >= 4."
+                )
+
+            if (
+                canonical
+                %
+                4
+                !=
+                0
+            ):
+
+                raise ValueError(
+                    "canonical_unet_resolution "
+                    "must be divisible by 4."
+                )
+
+        # -----------------------------------------------------------------
+        # RESAMPLING VALIDATION
+        # -----------------------------------------------------------------
+
+        valid_downsample = {
+            "area",
+            *VALID_RESIZE_METHODS,
+        }
+
+        if (
+            self.canonical_downsample_mode
+            not in
+            valid_downsample
+        ):
+
+            raise ValueError(
+                "Invalid canonical_downsample_mode: "
+                f"{self.canonical_downsample_mode}"
+            )
+
+        if (
+            self.canonical_upsample_mode
+            not in
+            VALID_RESIZE_METHODS
+        ):
+
+            raise ValueError(
+                "Invalid canonical_upsample_mode: "
+                f"{self.canonical_upsample_mode}"
+            )
+
+        if not (
+            0.0
+            <=
+            float(
+                self.canonical_native_blend
+            )
+            <=
+            1.0
+        ):
+
+            raise ValueError(
+                "canonical_native_blend must "
+                "be between 0 and 1."
+            )
+
+        # -----------------------------------------------------------------
+        # GEOMETRY SPACING
+        # -----------------------------------------------------------------
+
+        geometry_dx = float(
+            self.dx
+        )
+
+        geometry_dy = float(
+            self.dy
+        )
+
+        if (
+            self.canonical_geometry_resolution
+            is not None
+        ):
+
+            canonical_geometry = int(
+                self.canonical_geometry_resolution
+            )
+
+            geometry_dx = (
+                float(
+                    self.domain_length_x
+                )
+                /
+                float(
+                    canonical_geometry
+                )
+            )
+
+            geometry_dy = (
+                float(
+                    self.domain_length_y
+                )
+                /
+                float(
+                    canonical_geometry
+                )
+            )
+
+        # -----------------------------------------------------------------
+        # GEOMETRY ENCODER
+        # -----------------------------------------------------------------
+
         self.geometry_encoder = (
             GeometryEncoder2d(
-                output_width=self.width,
-                hidden_width=self.geometry_width,
-                depth=self.geometry_depth,
-                dx=self.dx,
-                dy=self.dy,
+                output_width=(
+                    self.width
+                ),
+
+                hidden_width=(
+                    self.geometry_width
+                ),
+
+                depth=(
+                    self.geometry_depth
+                ),
+
+                dx=(
+                    geometry_dx
+                ),
+
+                dy=(
+                    geometry_dy
+                ),
+
                 include_gradient_magnitude=(
                     self.include_gradient_magnitude
                 ),
             )
         )
 
+        # -----------------------------------------------------------------
+        # INPUT LIFTING
+        # -----------------------------------------------------------------
+
         self.fc0 = nn.Dense(
             self.width
         )
+
+        # -----------------------------------------------------------------
+        # FOURIER BLOCKS
+        # -----------------------------------------------------------------
 
         self.convs = [
             SpectralConv2d(
@@ -295,29 +956,50 @@ class GeometryUFNO2d(nn.Module):
                 self.modes1,
                 self.modes2,
             )
-            for _ in range(
+
+            for _
+            in range(
                 self.num_blocks
             )
         ]
 
+        # -----------------------------------------------------------------
+        # POINTWISE BRANCH
+        # -----------------------------------------------------------------
+
         self.ws = [
             nn.Conv(
                 self.width,
-                kernel_size=(1, 1),
+                kernel_size=(
+                    1,
+                    1,
+                ),
             )
-            for _ in range(
+
+            for _
+            in range(
                 self.num_blocks
             )
         ]
+
+        # -----------------------------------------------------------------
+        # U-NET BRANCH
+        # -----------------------------------------------------------------
 
         self.unets = [
             MiniUNet2d(
                 self.width
             )
-            for _ in range(
+
+            for _
+            in range(
                 self.num_u_blocks
             )
         ]
+
+        # -----------------------------------------------------------------
+        # OUTPUT
+        # -----------------------------------------------------------------
 
         self.fc1 = nn.Dense(
             128
@@ -326,6 +1008,208 @@ class GeometryUFNO2d(nn.Module):
         self.fc2 = nn.Dense(
             self.num_channels
         )
+
+    # =================================================================
+    # GEOMETRY ENCODER
+    # =================================================================
+
+    def _encode_geometry(
+        self,
+        c,
+        target_height,
+        target_width,
+    ):
+
+        canonical = (
+            self.canonical_geometry_resolution
+        )
+
+        # -----------------------------------------------------------------
+        # NATIVE TARGET GRID
+        # -----------------------------------------------------------------
+
+        if canonical is None:
+
+            return self.geometry_encoder(
+                c
+            )
+
+        canonical = int(
+            canonical
+        )
+
+        if (
+            c.shape[1] == canonical
+            and
+            c.shape[2] == canonical
+        ):
+
+            return self.geometry_encoder(
+                c
+            )
+
+        # -----------------------------------------------------------------
+        # TARGET -> CANONICAL
+        # -----------------------------------------------------------------
+
+        c_canonical = (
+            downsample_to_resolution(
+                c,
+                canonical,
+                canonical,
+                method=(
+                    self.canonical_downsample_mode
+                ),
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # GEOMETRY CNN
+        # -----------------------------------------------------------------
+
+        geometry_latent = (
+            self.geometry_encoder(
+                c_canonical
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # CANONICAL -> TARGET
+        # -----------------------------------------------------------------
+
+        geometry_latent = (
+            upsample_to_resolution(
+                geometry_latent,
+                target_height,
+                target_width,
+                method=(
+                    self.canonical_upsample_mode
+                ),
+            )
+        )
+
+        return geometry_latent
+
+    # =================================================================
+    # U-NET BRANCH
+    # =================================================================
+
+    def _apply_unet_branch(
+        self,
+        unet,
+        z,
+    ):
+
+        (
+            _,
+            height,
+            width,
+            _,
+        ) = z.shape
+
+        canonical = (
+            self.canonical_unet_resolution
+        )
+
+        # -----------------------------------------------------------------
+        # ORIGINAL NATIVE-RESOLUTION U-NET
+        # -----------------------------------------------------------------
+
+        if canonical is None:
+
+            return unet(
+                z
+            )
+
+        canonical = int(
+            canonical
+        )
+
+        if (
+            height == canonical
+            and
+            width == canonical
+        ):
+
+            return unet(
+                z
+            )
+
+        # -----------------------------------------------------------------
+        # TARGET -> CANONICAL
+        # -----------------------------------------------------------------
+
+        z_canonical = (
+            downsample_to_resolution(
+                z,
+                canonical,
+                canonical,
+                method=(
+                    self.canonical_downsample_mode
+                ),
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # U-NET AT TRAINING RESOLUTION
+        # -----------------------------------------------------------------
+
+        canonical_response = (
+            unet(
+                z_canonical
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # CANONICAL -> TARGET
+        # -----------------------------------------------------------------
+
+        canonical_response = (
+            upsample_to_resolution(
+                canonical_response,
+                height,
+                width,
+                method=(
+                    self.canonical_upsample_mode
+                ),
+            )
+        )
+
+        # -----------------------------------------------------------------
+        # OPTIONAL SMALL NATIVE-RESOLUTION CONTRIBUTION
+        # -----------------------------------------------------------------
+
+        blend = float(
+            self.canonical_native_blend
+        )
+
+        if blend <= 0.0:
+
+            return canonical_response
+
+        native_response = (
+            unet(
+                z
+            )
+        )
+
+        return (
+            (
+                1.0
+                -
+                blend
+            )
+            *
+            canonical_response
+            +
+            blend
+            *
+            native_response
+        )
+
+    # =================================================================
+    # FORWARD
+    # =================================================================
 
     def __call__(
         self,
@@ -336,9 +1220,14 @@ class GeometryUFNO2d(nn.Module):
     ) -> jnp.ndarray:
 
         if x.ndim == 3:
-            x = x[..., None]
+
+            x = x[
+                ...,
+                None
+            ]
 
         if c is None:
+
             raise ValueError(
                 "GeometryUFNO2d requires geometry c."
             )
@@ -347,9 +1236,16 @@ class GeometryUFNO2d(nn.Module):
             c
         )
 
-        batch_size, height, width, _ = (
-            x.shape
-        )
+        (
+            batch_size,
+            height,
+            width,
+            _,
+        ) = x.shape
+
+        # -----------------------------------------------------------------
+        # NORMALIZED GRID
+        # -----------------------------------------------------------------
 
         if grid is None:
 
@@ -380,7 +1276,10 @@ class GeometryUFNO2d(nn.Module):
             )
 
             grid = jnp.tile(
-                grid[None, ...],
+                grid[
+                    None,
+                    ...
+                ],
                 (
                     batch_size,
                     1,
@@ -388,6 +1287,10 @@ class GeometryUFNO2d(nn.Module):
                     1,
                 ),
             )
+
+        # -----------------------------------------------------------------
+        # LIFT INPUT
+        # -----------------------------------------------------------------
 
         lifted_input = jnp.concatenate(
             [
@@ -402,13 +1305,27 @@ class GeometryUFNO2d(nn.Module):
             lifted_input
         )
 
+        # -----------------------------------------------------------------
+        # GEOMETRY CONDITIONING
+        # -----------------------------------------------------------------
+
+        geometry_latent = (
+            self._encode_geometry(
+                c,
+                height,
+                width,
+            )
+        )
+
         z = (
             z
             +
-            self.geometry_encoder(
-                c
-            )
+            geometry_latent
         )
+
+        # -----------------------------------------------------------------
+        # TIME
+        # -----------------------------------------------------------------
 
         if (
             self.use_time
@@ -434,11 +1351,19 @@ class GeometryUFNO2d(nn.Module):
                 ]
             )
 
+        # -----------------------------------------------------------------
+        # FIRST U-NET BLOCK
+        # -----------------------------------------------------------------
+
         u_start = (
             self.num_blocks
             -
             self.num_u_blocks
         )
+
+        # -----------------------------------------------------------------
+        # OPERATOR BLOCKS
+        # -----------------------------------------------------------------
 
         for block_index in range(
             self.num_blocks
@@ -458,6 +1383,10 @@ class GeometryUFNO2d(nn.Module):
                 )
             )
 
+            # -------------------------------------------------------------
+            # U-NET CONTRIBUTION
+            # -------------------------------------------------------------
+
             if (
                 block_index
                 >=
@@ -470,18 +1399,25 @@ class GeometryUFNO2d(nn.Module):
                     u_start
                 )
 
-                block_output = (
-                    block_output
-                    +
-                    self.unets[
-                        unet_index
-                    ](
-                        z
+                unet_response = (
+                    self._apply_unet_branch(
+                        self.unets[
+                            unet_index
+                        ],
+                        z,
                     )
                 )
 
-            # Preserve the ordinary FNO convention:
-            # activation after every block except the last.
+                block_output = (
+                    block_output
+                    +
+                    unet_response
+                )
+
+            # -------------------------------------------------------------
+            # ACTIVATION
+            # -------------------------------------------------------------
+
             if (
                 block_index
                 <
@@ -498,18 +1434,54 @@ class GeometryUFNO2d(nn.Module):
 
                 z = block_output
 
+        # -----------------------------------------------------------------
+        # OUTPUT PROJECTION
+        # -----------------------------------------------------------------
+
         z = jnn.gelu(
             self.fc1(
                 z
             )
         )
 
-        return self.fc2(
-            z
+        output = (
+            self.fc2(
+                z
+            )
         )
+
+        # -----------------------------------------------------------------
+        # OPTIONAL SOURCE FILTER
+        # -----------------------------------------------------------------
+
+        if (
+            self.source_resolution_filter
+            is not None
+        ):
+
+            output = (
+                source_resolution_projection(
+                    output,
+
+                    source_resolution=(
+                        int(
+                            self.source_resolution_filter
+                        )
+                    ),
+
+                    taper_start=(
+                        self.filter_taper_start
+                    ),
+                )
+            )
+
+        return output
 
 
 __all__ = [
     "MiniUNet2d",
     "GeometryUFNO2d",
+    "downsample_to_resolution",
+    "upsample_to_resolution",
+    "source_resolution_projection",
 ]
